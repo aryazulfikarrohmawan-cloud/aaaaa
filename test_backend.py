@@ -148,8 +148,24 @@ class TestMiravaImaginer(unittest.TestCase):
             "POTRET SINEMATIK": "cinematic",
             "FOTO WARNA": "photorealistic"
         }
-        for ui_style, api_slug in STYLE_MAP.items():
-            self.assertEqual(STYLE_MAP[ui_style], api_slug)
+    def test_batch_queue_operations(self):
+        from app import enqueue_batch, get_latest_batch_state
+        test_prompts = ["Test prompt alpha", "Test prompt beta"]
+        b_id = enqueue_batch(
+            prompts=test_prompts,
+            model_id="nano-banana-2",
+            ratio="1:1",
+            quality="1K",
+            style="TANPA GAYA",
+            ref_image_ids=None
+        )
+        self.assertTrue(b_id.startswith("batch_"))
+        state = get_latest_batch_state()
+        self.assertEqual(state["batch_id"], b_id)
+        self.assertEqual(state["total"], 2)
+        self.assertEqual(len(state["items"]), 2)
+        self.assertEqual(state["items"][0]["prompt"], "Test prompt alpha")
+        self.assertEqual(state["items"][1]["prompt"], "Test prompt beta")
 
 if __name__ == "__main__":
     unittest.main()

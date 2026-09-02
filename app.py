@@ -1,9 +1,11 @@
 import os
+import sys
 import time
 import json
 import base64
 import sqlite3
 import datetime
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -14,11 +16,14 @@ from PIL import Image
 # ==========================================
 # CONSTANTS & CONFIGURATION
 # ==========================================
-BASE_URL = "https://imaginer.mirava.studio"
-DB_PATH = Path("history.db")
-OUTPUT_DIR = Path("outputs")
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "history.db"
+OUTPUT_DIR = BASE_DIR / "outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-STOP_FLAG_FILE = Path("stop_batch.flag")
+STOP_FLAG_FILE = BASE_DIR / "stop_batch.flag"
+PID_FILE = BASE_DIR / "worker.pid"
+
+BASE_URL = "https://imaginer.mirava.studio"
 
 MODEL_MATRIX = {
     "nano-banana-2": {
@@ -127,7 +132,7 @@ STYLE_MAP = {
 # DATABASE HELPER (SQLite & Config Persistence)
 # ==========================================
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS generations (
@@ -153,13 +158,55 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batch_jobs (
+                batch_id TEXT PRIMARY KEY,
+                total INTEGER NOT NULL,
+                model_id TEXT NOT NULL,
+                ratio TEXT NOT NULL,
+                quality TEXT,
+                style TEXT,
+                ref_image_ids TEXT,
+                status TEXT NOT NULL, -- 'active', 'completed', 'stopped'
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batch_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                item_index INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL, -- 'PENDING', 'LIMIT_RPM', 'SUBMITTED', 'RENDERING', 'SELESAI', 'GAGAL', 'DIBATALKAN'
+                duration_seconds INTEGER DEFAULT 0,
+                generation_id TEXT,
+                remote_urls TEXT,
+                local_paths TEXT,
+                gdrive_synced INTEGER DEFAULT 0,
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS batch_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                time_str TEXT NOT NULL,
+                log_type TEXT,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_gen_id ON generations(generation_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON generations(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_batch_items ON batch_items(batch_id, status)")
         conn.commit()
 
 def get_config(key: str, default: str = "") -> str:
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT value FROM app_config WHERE key = ?", (key,))
             row = cursor.fetchone()
@@ -171,7 +218,7 @@ def get_config(key: str, default: str = "") -> str:
 
 def set_config(key: str, value: str):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO app_config (key, value, updated_at)
@@ -184,7 +231,7 @@ def set_config(key: str, value: str):
 def record_generation_start(generation_id: str, model_id: str, prompt: str, ratio: str,
                             quality: Optional[str], style: Optional[str],
                             parameters: Dict[str, Any]):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO generations 
@@ -206,7 +253,7 @@ def update_generation_complete(generation_id: str, status: str,
                                remote_urls: List[str] = None,
                                local_paths: List[str] = None,
                                error_message: str = None):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE generations
@@ -225,7 +272,7 @@ def update_generation_complete(generation_id: str, status: str,
         conn.commit()
 
 def fetch_history(search_query: str = "", model_filter: str = "All"):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         query = "SELECT * FROM generations WHERE 1=1"
@@ -245,7 +292,7 @@ def fetch_history(search_query: str = "", model_filter: str = "All"):
         return [dict(row) for row in rows]
 
 def delete_generation(record_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT local_paths FROM generations WHERE id = ?", (record_id,))
@@ -263,15 +310,179 @@ def delete_generation(record_id: int):
         conn.commit()
 
 # ==========================================
+# WORKER PROCESS & LIFECYCLE MANAGEMENT
+# ==========================================
+def is_worker_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        with open(PID_FILE, "r") as f:
+            pid_str = f.read().strip()
+            if not pid_str:
+                return False
+            pid = int(pid_str)
+        import psutil
+        if psutil.pid_exists(pid):
+            p = psutil.Process(pid)
+            if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                return True
+    except Exception:
+        pass
+    return False
+
+def start_worker_daemon():
+    if not is_worker_running():
+        flags = 0x08000000 if os.name == 'nt' else 0  # CREATE_NO_WINDOW
+        subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "worker.py")],
+            creationflags=flags,
+            close_fds=True,
+            cwd=str(BASE_DIR)
+        )
+        time.sleep(0.5)
+
+def enqueue_batch(prompts: List[str], model_id: str, ratio: str,
+                  quality: Optional[str], style: Optional[str],
+                  ref_image_ids: Optional[List[str]]) -> str:
+    batch_id = datetime.datetime.now().strftime("batch_%Y%m%d_%H%M%S")
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        c = conn.cursor()
+        # Set any previously active jobs to stopped
+        c.execute("UPDATE batch_jobs SET status = 'stopped' WHERE status = 'active'")
+        c.execute("""
+            INSERT INTO batch_jobs 
+            (batch_id, total, model_id, ratio, quality, style, ref_image_ids, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', datetime('now','localtime'), datetime('now','localtime'))
+        """, (
+            batch_id,
+            len(prompts),
+            model_id,
+            ratio,
+            quality or "",
+            style or "",
+            json.dumps(ref_image_ids or [])
+        ))
+        for idx, p_text in enumerate(prompts):
+            c.execute("""
+                INSERT INTO batch_items
+                (batch_id, item_index, prompt, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'PENDING', datetime('now','localtime'), datetime('now','localtime'))
+            """, (batch_id, idx + 1, p_text))
+        
+        c.execute("""
+            INSERT INTO batch_logs (batch_id, time_str, log_type, message)
+            VALUES (?, ?, 'active', ?)
+        """, (batch_id, datetime.datetime.now().strftime("%H:%M:%S"), f"Batch didaftarkan ({len(prompts)} prompt). Worker latar belakang aktif."))
+        conn.commit()
+
+    start_worker_daemon()
+    return batch_id
+
+def get_latest_batch_state() -> Dict[str, Any]:
+    state = {
+        "batch_id": None,
+        "status": "idle",
+        "total": 0,
+        "success": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "active": 0,
+        "remaining": 0,
+        "items": [],
+        "logs": [],
+        "latest_images": [],
+        "is_active": False
+    }
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("SELECT * FROM batch_jobs ORDER BY created_at DESC LIMIT 1")
+            job = c.fetchone()
+            if not job:
+                return state
+            
+            b_id = job["batch_id"]
+            state["batch_id"] = b_id
+            state["status"] = job["status"]
+            state["total"] = job["total"]
+            
+            c.execute("SELECT * FROM batch_items WHERE batch_id = ? ORDER BY item_index ASC", (b_id,))
+            items = [dict(r) for r in c.fetchall()]
+            state["items"] = items
+
+            c.execute("SELECT * FROM batch_logs WHERE batch_id = ? ORDER BY id ASC", (b_id,))
+            state["logs"] = [dict(r) for r in c.fetchall()]
+
+            success_cnt = sum(1 for it in items if it["status"] == "SELESAI")
+            failed_cnt = sum(1 for it in items if it["status"] == "GAGAL")
+            cancelled_cnt = sum(1 for it in items if it["status"] == "DIBATALKAN")
+            active_cnt = sum(1 for it in items if it["status"] in ("LIMIT_RPM", "SUBMITTED", "RENDERING"))
+            remaining_cnt = sum(1 for it in items if it["status"] == "PENDING")
+
+            state["success"] = success_cnt
+            state["failed"] = failed_cnt
+            state["cancelled"] = cancelled_cnt
+            state["active"] = active_cnt
+            state["remaining"] = remaining_cnt
+            state["is_active"] = (job["status"] == "active" and (active_cnt > 0 or remaining_cnt > 0))
+
+            # Extract completed images
+            for it in items:
+                if it["local_paths"]:
+                    try:
+                        paths = json.loads(it["local_paths"])
+                        for p in paths:
+                            if p and Path(p).exists() and p not in state["latest_images"]:
+                                state["latest_images"].append(p)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return state
+
+# ==========================================
+# WINDOWS STARTUP AUTO-RESUME HELPER
+# ==========================================
+def get_startup_dir() -> Path:
+    return Path(os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"))
+
+def is_startup_enabled() -> bool:
+    target = get_startup_dir() / "Mirava_Auto_Resume.vbs"
+    return target.exists()
+
+def enable_startup_autoresume() -> bool:
+    try:
+        vbs_content = (
+            'Set WshShell = CreateObject("WScript.Shell")\n'
+            f'currentDir = "{BASE_DIR}"\n'
+            'WshShell.CurrentDirectory = currentDir\n'
+            'WshShell.Run "cmd /c python worker.py", 0, False\n'
+        )
+        target = get_startup_dir() / "Mirava_Auto_Resume.vbs"
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(vbs_content)
+        return True
+    except Exception:
+        return False
+
+def disable_startup_autoresume() -> bool:
+    try:
+        target = get_startup_dir() / "Mirava_Auto_Resume.vbs"
+        if target.exists():
+            target.unlink()
+        return True
+    except Exception:
+        return False
+
+# ==========================================
 # GOOGLE DRIVE SYNC HELPER
 # ==========================================
 def is_gdrive_sync_enabled() -> bool:
     return get_config("gdrive_enabled", "false").lower() == "true"
 
 def upload_to_gdrive(file_path: str, log_callback=None) -> bool:
-    """Uploads a local image file to Google Drive via configured method."""
     mode = get_config("gdrive_mode", "webhook")
-
     if mode == "webhook":
         webhook_url = get_config("gdrive_webhook_url", "").strip()
         if not webhook_url:
@@ -288,10 +499,8 @@ def upload_to_gdrive(file_path: str, log_callback=None) -> bool:
         }
         resp = requests.post(webhook_url, json=payload, timeout=60)
         
-        # Check if Google returned a script error
         if "Fungsi skrip tidak ditemukan" in resp.text or "Script function not found" in resp.text:
             raise RuntimeError("Fungsi 'doPost' belum aktif pada URL ini. Kemungkinan besar Google telah membuatkan URL WEB APP BARU saat Anda klik Deploy. Silakan salin URL Web App yang baru dari Google Apps Script dan tempelkan ke kolom di atas.")
-        
         if "Google Accounts" in resp.text or "Sign in" in resp.text:
             raise RuntimeError("Akses ditolak oleh Google. Pastikan setelan 'Who has access' pada Web app diatur ke 'Anyone'.")
             
@@ -363,9 +572,6 @@ class RPMRateLimiter:
             elapsed_since_oldest = now - oldest_ts
             sleep_needed = max(1.0, 60.0 - elapsed_since_oldest + 1.0)
             
-            if log_callback:
-                log_callback(f"⏱️ Limit {self.max_rpm} RPM aktif ({len(self.request_timestamps)}/{self.max_rpm} request). Menunggu {int(sleep_needed)}s...", "active")
-            
             step = 0.5
             total_slept = 0.0
             while total_slept < sleep_needed:
@@ -413,180 +619,9 @@ class MiravaAPIClient:
             raise RuntimeError(f"Respon upload tidak memiliki field image_id: {data}")
         return str(image_id)
 
-    def get_models(self) -> List[Dict[str, Any]]:
-        url = f"{self.base_url}/api/public/v1/models"
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict):
-                    return data.get("data") or data.get("models") or []
-                elif isinstance(data, list):
-                    return data
-        except Exception:
-            pass
-        return []
-
-    def create_generation_task(self, model_id: str, prompt: str, ratio: str,
-                               quality: Optional[str] = None,
-                               style: Optional[str] = None,
-                               ref_image_ids: Optional[List[str]] = None,
-                               log_callback = None,
-                               stop_check_callback = None) -> str:
-        url = f"{self.base_url}/api/public/v1/generate"
-        payload = {
-            "model_id": model_id,
-            "prompt": prompt,
-            "ratio": ratio
-        }
-
-        if quality:
-            payload["quality"] = quality
-
-        if style:
-            s_clean = str(style).strip().upper()
-            if s_clean not in ("TANPA GAYA", "TANPA GAYA (DEFAULT)", "DINAMIS", "NONE", "DEFAULT", "AUTO", "TANPA STYLE", ""):
-                api_style = STYLE_MAP.get(s_clean, style.lower().replace(" ", "-"))
-                if api_style:
-                    payload["style"] = api_style
-
-        if ref_image_ids:
-            payload["ref_image_ids"] = ref_image_ids
-
-        headers = {
-            **self.headers,
-            "Content-Type": "application/json"
-        }
-
-        max_retries = 6
-        base_delay = 12
-
-        for attempt in range(max_retries):
-            if stop_check_callback and stop_check_callback():
-                raise InterruptedError("Batch dihentikan pengguna.")
-
-            try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            except Exception as conn_err:
-                if attempt < max_retries - 1:
-                    time.sleep(3)
-                    continue
-                raise conn_err
-
-            if resp.status_code == 429:
-                retry_header = resp.headers.get("Retry-After")
-                try:
-                    wait_s = int(retry_header) if retry_header else (base_delay * (attempt + 1))
-                except Exception:
-                    wait_s = base_delay * (attempt + 1)
-                
-                if log_callback:
-                    log_callback(f"⏳ Rate Limit (429) tercapai. Menunggu {wait_s}s sebelum auto-retry ({attempt+1}/{max_retries})...", "active")
-                
-                total_w = 0.0
-                while total_w < wait_s:
-                    if stop_check_callback and stop_check_callback():
-                        raise InterruptedError("Batch dihentikan pengguna.")
-                    time.sleep(0.5)
-                    total_w += 0.5
-                continue
-
-            if resp.status_code not in (200, 201, 202):
-                raise RuntimeError(f"Gagal membuat tugas generasi ({resp.status_code}): {resp.text}")
-
-            data = resp.json()
-            generation_id = None
-            if isinstance(data, dict):
-                generation_id = data.get("generation_id") or data.get("id")
-                if not generation_id and "data" in data and isinstance(data["data"], dict):
-                    generation_id = data["data"].get("generation_id") or data["data"].get("id")
-
-            if not generation_id:
-                raise RuntimeError(f"Respon generate tidak menyertakan generation_id: {data}")
-            return str(generation_id)
-
-        raise RuntimeError(f"Gagal membuat tugas generasi (429): Batas RPM limit terlampaui setelah {max_retries} kali percobaan.")
-
-    def check_task_status(self, generation_id: str) -> Dict[str, Any]:
-        url = f"{self.base_url}/api/public/v1/generate/{generation_id}"
-        resp = None
-        for _ in range(3):
-            try:
-                resp = requests.get(url, headers=self.headers, timeout=30)
-                if resp.status_code == 429:
-                    time.sleep(5)
-                    continue
-                if resp.status_code != 200:
-                    return {
-                        "status": "error",
-                        "error": f"HTTP {resp.status_code}: {resp.text}",
-                        "urls": []
-                    }
-                break
-            except Exception:
-                time.sleep(2)
-        
-        if not resp or resp.status_code != 200:
-            return {
-                "status": "error",
-                "error": "Gagal menghubungi server status render.",
-                "urls": []
-            }
-
-        data = resp.json()
-        status_val = "processing"
-        urls = []
-        error_msg = None
-
-        if isinstance(data, dict):
-            content = data.get("data", data)
-            raw_status = str(content.get("status", "")).lower()
-
-            if raw_status in ("success", "completed", "done", "succeeded"):
-                status_val = "success"
-                raw_urls = content.get("urls") or content.get("url") or []
-                if isinstance(raw_urls, str):
-                    urls = [raw_urls]
-                elif isinstance(raw_urls, list):
-                    urls = raw_urls
-            elif raw_status in ("failed", "error", "rejected"):
-                status_val = "failed"
-                error_msg = content.get("error") or content.get("message") or "Unknown API generation error."
-            else:
-                status_val = "processing"
-        
-        return {
-            "status": status_val,
-            "urls": urls,
-            "error": error_msg,
-            "raw": data
-        }
-
 def download_remote_image(url: str, generation_id: str, index: int) -> Optional[str]:
-    try:
-        resp = requests.get(url, timeout=60, stream=True)
-        if resp.status_code == 200:
-            content_type = resp.headers.get("Content-Type", "")
-            if "png" in content_type:
-                ext = ".png"
-            elif "webp" in content_type:
-                ext = ".webp"
-            else:
-                ext = ".jpg"
-            
-            clean_gen_id = "".join(c for c in generation_id if c.isalnum() or c in "-_")
-            timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{clean_gen_id}_{timestamp_str}_{index}{ext}"
-            file_path = OUTPUT_DIR / filename
-
-            with open(file_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            return str(file_path)
-    except Exception as e:
-        st.warning(f"Gagal mengunduh gambar ke penyimpanan lokal: {e}")
-    return None
+    from worker import download_image
+    return download_image(url, generation_id, index)
 
 # ==========================================
 # UI HELPER: PROMPT STATUS LIST IN MONITOR
@@ -601,24 +636,25 @@ def render_monitor_prompt_status(items: List[Dict[str, Any]], container):
         
         rows_html = []
         for it in items:
-            st_type = it.get("status", "MENUNGGU")
+            st_type = it.get("status", "PENDING")
             badge_color = "#94a3b8"
             badge_bg = "rgba(148, 163, 184, 0.1)"
             badge_border = "#334155"
             status_text = "⏳ Menunggu"
 
+            dur_sec = it.get("duration_seconds", 0)
+            dur_str = f" • {dur_sec}s" if dur_sec > 0 else ""
+
             if st_type == "SELESAI":
                 badge_color = "#34d399"
                 badge_bg = "rgba(16, 185, 129, 0.15)"
                 badge_border = "#10b981"
-                dur = f" • {it.get('time', '')}" if it.get("time") else ""
-                status_text = f"✅ Selesai{dur}"
-            elif st_type in ("RENDERING", "SUBMIT"):
+                status_text = f"✅ Selesai{dur_str}"
+            elif st_type in ("RENDERING", "SUBMITTED"):
                 badge_color = "#67e8f9"
                 badge_bg = "rgba(6, 182, 212, 0.15)"
                 badge_border = "#06b6d4"
-                dur = f" ({it.get('time', '')})" if it.get("time") else ""
-                status_text = f"🎨 Render{dur}"
+                status_text = f"🎨 Render{dur_str}"
             elif st_type == "LIMIT_RPM":
                 badge_color = "#e5fe00"
                 badge_bg = "rgba(229, 254, 0, 0.12)"
@@ -637,10 +673,11 @@ def render_monitor_prompt_status(items: List[Dict[str, Any]], container):
 
             p_text = it.get("prompt", "")
             p_short = (p_text[:50] + "...") if len(p_text) > 50 else p_text
+            idx_num = it.get("item_index", it.get("index", 1))
 
-            row = f'<div style="background:#0b0f19; border:1px solid #1e293b; border-left:3px solid {badge_border}; padding:0.42rem 0.65rem; border-radius:3px; margin-bottom:0.35rem; display:flex; justify-content:space-between; align-items:center; font-family:\'JetBrains Mono\',monospace;"><div style="font-size:0.78rem; color:#f1f5f9; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:65%;"><b>[#{it.get("index")}]</b> {p_short}</div><div style="font-size:0.72rem; font-weight:700; color:{badge_color}; background:{badge_bg}; border:1px solid {badge_border}; padding:0.18rem 0.5rem; border-radius:3px; white-space:nowrap;">{status_text}</div></div>'
-            if it.get("error"):
-                row += f'<div style="color:#f87171; font-size:0.72rem; font-family:\'JetBrains Mono\',monospace; padding-left:0.5rem; margin-bottom:0.35rem;">❌ {it.get("error")}</div>'
+            row = f'<div style="background:#0b0f19; border:1px solid #1e293b; border-left:3px solid {badge_border}; padding:0.42rem 0.65rem; border-radius:3px; margin-bottom:0.35rem; display:flex; justify-content:space-between; align-items:center; font-family:\'JetBrains Mono\',monospace;"><div style="font-size:0.78rem; color:#f1f5f9; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:65%;"><b>[#{idx_num}]</b> {p_short}</div><div style="font-size:0.72rem; font-weight:700; color:{badge_color}; background:{badge_bg}; border:1px solid {badge_border}; padding:0.18rem 0.5rem; border-radius:3px; white-space:nowrap;">{status_text}</div></div>'
+            if it.get("error_message"):
+                row += f'<div style="color:#f87171; font-size:0.72rem; font-family:\'JetBrains Mono\',monospace; padding-left:0.5rem; margin-bottom:0.35rem;">❌ {it.get("error_message")}</div>'
             rows_html.append(row)
 
         full_html = f'<div style="max-height:220px; overflow-y:auto; margin-bottom:0.75rem;">' + "".join(rows_html) + '</div>'
@@ -658,6 +695,8 @@ def main():
     )
 
     init_db()
+    # Always ensure background worker daemon is alive
+    start_worker_daemon()
 
     saved_key = get_config("api_key", os.getenv("MIRAVA_API_KEY", ""))
     saved_rpm = int(get_config("max_rpm", "5"))
@@ -674,16 +713,6 @@ def main():
         st.session_state["selected_ratio"] = "1:1"
     if "selected_style" not in st.session_state:
         st.session_state["selected_style"] = "TANPA GAYA"
-    if "batch_logs" not in st.session_state:
-        st.session_state["batch_logs"] = []
-    if "prompt_tracker_items" not in st.session_state:
-        st.session_state["prompt_tracker_items"] = []
-    if "batch_stats" not in st.session_state:
-        st.session_state["batch_stats"] = {
-            "total": 0, "success": 0, "failed": 0, "cancelled": 0, "active": 0, "remaining": 0
-        }
-    if "latest_images" not in st.session_state:
-        st.session_state["latest_images"] = []
     if "nav_view" not in st.session_state:
         st.session_state["nav_view"] = "BATCH"
 
@@ -780,7 +809,7 @@ def main():
             border: 1px solid #1e2430;
             border-radius: 4px;
             padding: 1rem;
-            min-height: 300px;
+            min-height: 280px;
         }
 
         .yellow-badge {
@@ -886,6 +915,20 @@ def main():
         .log-entry.success { border-left-color: #10b981; color: #34d399; }
         .log-entry.failed { border-left-color: #ef4444; color: #f87171; }
         .log-entry.active { border-left-color: #e5fe00; color: #e5fe00; }
+
+        .bg-banner {
+            border: 1px solid #10b981;
+            background: rgba(16, 185, 129, 0.12);
+            padding: 0.6rem 0.85rem;
+            border-radius: 4px;
+            margin-bottom: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.78rem;
+            color: #34d399;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -910,11 +953,13 @@ def main():
         api_status_icon = "🟢" if st.session_state["api_key"] else "🔴"
         api_status_txt = "Tersimpan" if st.session_state["api_key"] else "Belum Diisi"
         gdrive_status = "🟢 ON" if is_gdrive_sync_enabled() else "⚪ OFF"
+        worker_icon = "🟢 DAEMON" if is_worker_running() else "🟡 IDLE"
         st.markdown(f"""
             <div style="text-align:right; font-family:'JetBrains Mono',monospace; font-size:0.75rem; padding-top:0.6rem; color:#94a3b8;">
                 <span>API: <b>{api_status_icon} {api_status_txt}</b></span> &nbsp;•&nbsp; 
                 <span>LIMIT: <b style="color:#e5fe00;">{st.session_state['max_rpm']} RPM</b></span> &nbsp;•&nbsp;
-                <span>G-DRIVE: <b>{gdrive_status}</b></span>
+                <span>G-DRIVE: <b>{gdrive_status}</b></span> &nbsp;•&nbsp;
+                <span>WORKER: <b>{worker_icon}</b></span>
             </div>
         """, unsafe_allow_html=True)
 
@@ -922,6 +967,9 @@ def main():
     # VIEW 1: BATCH GENERATE
     # ---------------------------------------------------------
     if st.session_state["nav_view"] == "BATCH":
+        # Fetch current background queue state directly from database
+        batch_state = get_latest_batch_state()
+
         left_col, right_col = st.columns([1.18, 0.82], gap="large")
 
         # ==========================================
@@ -934,7 +982,7 @@ def main():
 
             st.markdown(f"""
                 <div class="top-meta-bar">
-                    <span>MODE 01 — BATCH RUNNER</span>
+                    <span>MODE 01 — PERSISTENT BACKGROUND RUNNER</span>
                     <span>{meta_str}</span>
                 </div>
                 <div class="main-brand-title">
@@ -1106,21 +1154,6 @@ def main():
                 </div>
             """, unsafe_allow_html=True)
 
-            # Ensure prompt tracker items are synchronized
-            if not st.session_state["prompt_tracker_items"] or len(st.session_state["prompt_tracker_items"]) != len(prompt_lines):
-                st.session_state["prompt_tracker_items"] = [
-                    {
-                        "index": idx + 1,
-                        "prompt": p_text,
-                        "status": "MENUNGGU",
-                        "badge": "⏳ MENUNGGU",
-                        "time": "",
-                        "error": None,
-                        "file": None
-                    }
-                    for idx, p_text in enumerate(prompt_lines)
-                ]
-
             # Storage & Cloud Status Indicator
             st_col1, st_col2 = st.columns([3.8, 1.0])
             with st_col1:
@@ -1155,7 +1188,7 @@ def main():
                     st.success("✅ API Key berhasil disimpan permanen ke database!")
                     st.rerun()
 
-            can_run = has_api_key and len(prompt_lines) > 0
+            can_run = has_api_key and len(prompt_lines) > 0 and not batch_state["is_active"]
             if active_model_spec["max_prompt_chars"] and longest_char > active_model_spec["max_prompt_chars"]:
                 can_run = False
                 st.error(f"Salah satu prompt melebihi batas maksimum {active_model_spec['max_prompt_chars']} karakter.")
@@ -1176,12 +1209,15 @@ def main():
                 stop_batch_btn = st.button(
                     "🛑 STOP BATCH",
                     key="btn_trigger_stop",
-                    use_container_width=True
+                    use_container_width=True,
+                    disabled=not batch_state["is_active"]
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
                 if stop_batch_btn:
                     STOP_FLAG_FILE.touch()
-                    st.warning("🛑 Sinyal berhenti dikirim ke proses batch...")
+                    st.warning("🛑 Sinyal berhenti dikirim ke background worker...")
+                    time.sleep(0.5)
+                    st.rerun()
 
             with rate_info_col:
                 if has_api_key:
@@ -1191,72 +1227,101 @@ def main():
                         </div>
                     """, unsafe_allow_html=True)
 
+            # SUBMIT TO BACKGROUND QUEUE
+            if run_batch_btn:
+                ref_image_ids = []
+                if uploaded_refs:
+                    with st.spinner("Mengunggah gambar referensi..."):
+                        client = MiravaAPIClient(st.session_state["api_key"])
+                        for r_f in uploaded_refs:
+                            try:
+                                rid = client.upload_reference_image(r_f)
+                                ref_image_ids.append(rid)
+                            except Exception as e:
+                                st.error(f"Gagal upload referensi: {e}")
+
+                b_id = enqueue_batch(
+                    prompts=prompt_lines,
+                    model_id=st.session_state["selected_model"],
+                    ratio=st.session_state["selected_ratio"],
+                    quality=st.session_state.get("selected_quality", None),
+                    style=st.session_state["selected_style"],
+                    ref_image_ids=ref_image_ids
+                )
+                st.success(f"🚀 Batch didaftarkan ke background worker (ID: {b_id})!")
+                time.sleep(0.5)
+                st.rerun()
+
         # ==========================================
         # RIGHT PANEL: MONITOR & METRICS
         # ==========================================
         with right_col:
             st.markdown('<div class="section-label"><span>MONITOR & METRICS</span></div>', unsafe_allow_html=True)
-            
-            stats = st.session_state["batch_stats"]
+
+            if batch_state["is_active"]:
+                st.markdown("""
+                    <div class="bg-banner">
+                        <span>🟢 <b>BATCH BERJALAN DI LATAR BELAKANG</b></span>
+                        <span style="font-size:0.72rem; color:#a7f3d0;">Aman menutup website/browser kapan saja</span>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            # 6 METRICS BOXES DIRECTLY DRIVEN BY SQLITE STATE
             st.markdown(f"""
                 <div class="metric-row">
                     <div class="metric-box">
-                        <div class="metric-val">{stats['total']}</div>
+                        <div class="metric-val">{batch_state['total']}</div>
                         <div class="metric-lbl">TOTAL</div>
                     </div>
                     <div class="metric-box">
-                        <div class="metric-val" style="color:#34d399;">{stats['success']}</div>
+                        <div class="metric-val" style="color:#34d399;">{batch_state['success']}</div>
                         <div class="metric-lbl">SUCCESS</div>
                     </div>
                     <div class="metric-box">
-                        <div class="metric-val" style="color:#f87171;">{stats['failed']}</div>
+                        <div class="metric-val" style="color:#f87171;">{batch_state['failed']}</div>
                         <div class="metric-lbl">FAILED</div>
                     </div>
                     <div class="metric-box">
-                        <div class="metric-val" style="color:#fb923c;">{stats['cancelled']}</div>
+                        <div class="metric-val" style="color:#fb923c;">{batch_state['cancelled']}</div>
                         <div class="metric-lbl">CANCELLED</div>
                     </div>
                     <div class="metric-box">
-                        <div class="metric-val" style="color:#e5fe00;">{stats['active']}</div>
+                        <div class="metric-val" style="color:#e5fe00;">{batch_state['active']}</div>
                         <div class="metric-lbl">ACTIVE</div>
                     </div>
                     <div class="metric-box">
-                        <div class="metric-val">{stats['remaining']}</div>
+                        <div class="metric-val">{batch_state['remaining']}</div>
                         <div class="metric-lbl">REMAINING</div>
                     </div>
                 </div>
             """, unsafe_allow_html=True)
 
-            # STATUS TIAP PROMPT INSIDE MONITOR & METRICS
+            # LIVE STATUS OF EVERY PROMPT ROW
             prompt_status_container = st.empty()
-            render_monitor_prompt_status(st.session_state["prompt_tracker_items"], prompt_status_container)
+            render_monitor_prompt_status(batch_state["items"], prompt_status_container)
 
-            # LIVE TERMINAL LOGS
+            # LIVE TERMINAL LOGS DIRECTLY FROM SQLITE
             st.markdown('<div class="section-label"><span>LIVE TERMINAL LOGS</span></div>', unsafe_allow_html=True)
             logs_container = st.empty()
-
-            def render_logs_ui():
-                if not st.session_state["batch_logs"]:
-                    logs_container.markdown("""
-                        <div class="terminal-panel logs-empty">
-                            <div class="logs-empty-number">0</div>
-                            <div class="logs-empty-text">LOGS WILL APPEAR HERE</div>
-                        </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    log_html = '<div class="terminal-panel" style="max-height: 300px; overflow-y: auto;">'
-                    for l in st.session_state["batch_logs"]:
-                        log_html += f'<div class="log-entry {l.get("type", "")}">[{l["time"]}] {l["text"]}</div>'
-                    log_html += '</div>'
-                    logs_container.markdown(log_html, unsafe_allow_html=True)
-
-            render_logs_ui()
+            if not batch_state["logs"]:
+                logs_container.markdown("""
+                    <div class="terminal-panel logs-empty">
+                        <div class="logs-empty-number">0</div>
+                        <div class="logs-empty-text">LOGS WILL APPEAR HERE</div>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                log_html = '<div class="terminal-panel" style="max-height: 280px; overflow-y: auto;">'
+                for l in batch_state["logs"]:
+                    log_html += f'<div class="log-entry {l.get("log_type", "")}">[{l.get("time_str", "")}] {l.get("message", "")}</div>'
+                log_html += '</div>'
+                logs_container.markdown(log_html, unsafe_allow_html=True)
 
             # Completed Image Output Preview
-            if st.session_state["latest_images"]:
+            if batch_state["latest_images"]:
                 st.markdown('<div class="section-label"><span>HASIL GAMBAR GENERASI TERAKHIR</span></div>', unsafe_allow_html=True)
-                img_cols = st.columns(min(len(st.session_state["latest_images"]), 2))
-                for idx, img_path in enumerate(st.session_state["latest_images"]):
+                img_cols = st.columns(min(len(batch_state["latest_images"]), 2))
+                for idx, img_path in enumerate(batch_state["latest_images"][:4]):
                     with img_cols[idx % 2]:
                         if Path(img_path).exists():
                             st.image(img_path, use_container_width=True)
@@ -1270,230 +1335,9 @@ def main():
                                     use_container_width=True
                                 )
 
-        # ==========================================
-        # EXECUTION ENGINE: BATCH PROCESSOR WITH STOP & TRACKER
-        # ==========================================
-        if run_batch_btn:
-            if STOP_FLAG_FILE.exists():
-                STOP_FLAG_FILE.unlink()
-
-            client = MiravaAPIClient(st.session_state["api_key"])
-            limiter = st.session_state["rate_limiter"]
-            limiter.max_rpm = st.session_state["max_rpm"]
-            total_items = len(prompt_lines)
-            
-            st.session_state["batch_stats"] = {
-                "total": total_items,
-                "success": 0,
-                "failed": 0,
-                "cancelled": 0,
-                "active": 0,
-                "remaining": total_items
-            }
-            st.session_state["batch_logs"] = []
-            st.session_state["latest_images"] = []
-
-            st.session_state["prompt_tracker_items"] = [
-                {
-                    "index": idx + 1,
-                    "prompt": p_text,
-                    "status": "MENUNGGU",
-                    "badge": "⏳ MENUNGGU",
-                    "time": "",
-                    "error": None,
-                    "file": None
-                }
-                for idx, p_text in enumerate(prompt_lines)
-            ]
-
-            def is_stop_requested() -> bool:
-                return STOP_FLAG_FILE.exists()
-
-            def append_log(text: str, log_type: str = ""):
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                st.session_state["batch_logs"].append({"time": timestamp, "text": text, "type": log_type})
-                render_logs_ui()
-
-            def update_item_status(idx: int, status: str, badge: str, time_str: str = "", err: str = None, file_p: str = None):
-                if 0 <= idx < len(st.session_state["prompt_tracker_items"]):
-                    st.session_state["prompt_tracker_items"][idx]["status"] = status
-                    st.session_state["prompt_tracker_items"][idx]["badge"] = badge
-                    if time_str:
-                        st.session_state["prompt_tracker_items"][idx]["time"] = time_str
-                    if err:
-                        st.session_state["prompt_tracker_items"][idx]["error"] = err
-                    if file_p:
-                        st.session_state["prompt_tracker_items"][idx]["file"] = file_p
-                    render_monitor_prompt_status(st.session_state["prompt_tracker_items"], prompt_status_container)
-
-            append_log(f"Memulai tugas Batch Generate ({total_items} prompt) • Limit {limiter.max_rpm} RPM.", "active")
-            render_monitor_prompt_status(st.session_state["prompt_tracker_items"], prompt_status_container)
-
-            # Upload Reference Images if present
-            ref_image_ids = []
-            if uploaded_refs:
-                append_log(f"Mengunggah {len(uploaded_refs)} gambar referensi...")
-                for r_idx, ref_f in enumerate(uploaded_refs):
-                    if is_stop_requested():
-                        break
-                    try:
-                        rid = client.upload_reference_image(ref_f)
-                        ref_image_ids.append(rid)
-                        append_log(f"Referensi #{r_idx+1} terunggah (ID: {rid})", "active")
-                    except Exception as e:
-                        append_log(f"Gagal upload referensi #{r_idx+1}: {e}", "failed")
-
-            # Sequential Batch Loop
-            cancelled_by_user = False
-            for i, p_text in enumerate(prompt_lines):
-                if is_stop_requested():
-                    cancelled_by_user = True
-                    break
-
-                st.session_state["batch_stats"]["active"] = 1
-                st.session_state["batch_stats"]["remaining"] = total_items - i
-                
-                selected_model = st.session_state["selected_model"]
-                selected_ratio = st.session_state["selected_ratio"]
-                selected_quality = st.session_state.get("selected_quality", None)
-                if selected_quality and not MODEL_MATRIX[selected_model]["qualities"]:
-                    selected_quality = None
-                selected_style = st.session_state["selected_style"]
-                if not MODEL_MATRIX[selected_model]["support_style"]:
-                    selected_style = None
-
-                # Enforce Rate Limiter Slot Delay
-                update_item_status(i, "LIMIT_RPM", "⏱️ CEK SLOT RPM")
-                slot_ok = limiter.wait_for_slot(log_callback=append_log, stop_check_callback=is_stop_requested)
-                
-                if not slot_ok or is_stop_requested():
-                    cancelled_by_user = True
-                    break
-
-                prompt_start_time = time.time()
-                update_item_status(i, "SUBMIT", "🚀 MENGIRIM TUGAS")
-                append_log(f"[{i+1}/{total_items}] Mengirim prompt: \"{p_text[:45]}...\"", "active")
-
-                try:
-                    # Submit generate task
-                    gen_id = client.create_generation_task(
-                        model_id=selected_model,
-                        prompt=p_text,
-                        ratio=selected_ratio,
-                        quality=selected_quality,
-                        style=selected_style,
-                        ref_image_ids=ref_image_ids if ref_image_ids else None,
-                        log_callback=append_log,
-                        stop_check_callback=is_stop_requested
-                    )
-                    append_log(f"Tugas diterima: ID `{gen_id}`. Memulai polling...", "active")
-                    update_item_status(i, "RENDERING", "🎨 RENDERING", time_str="0s")
-
-                    # Record initial state in SQLite
-                    record_generation_start(
-                        generation_id=gen_id,
-                        model_id=selected_model,
-                        prompt=p_text,
-                        ratio=selected_ratio,
-                        quality=selected_quality,
-                        style=selected_style,
-                        parameters={"ratio": selected_ratio, "quality": selected_quality, "style": selected_style}
-                    )
-
-                    # Polling Loop (Safe 8s interval)
-                    start_t = time.time()
-                    success_urls = []
-                    while time.time() - start_t < 300:
-                        if is_stop_requested():
-                            cancelled_by_user = True
-                            break
-
-                        status_res = client.check_task_status(gen_id)
-                        c_status = status_res.get("status")
-                        elapsed_s = int(time.time() - prompt_start_time)
-                        update_item_status(i, "RENDERING", "🎨 RENDERING", time_str=f"{elapsed_s}s")
-
-                        if c_status == "success":
-                            success_urls = status_res.get("urls", [])
-                            break
-                        elif c_status in ("failed", "error"):
-                            err_str = str(status_res.get("error", ""))
-                            if "429" in err_str or "rate" in err_str.lower():
-                                append_log("⏳ Polling rate limit, menunggu 10s...", "active")
-                                time.sleep(10)
-                                continue
-                            raise RuntimeError(err_str or "Generation failed on server.")
-                        
-                        # Wait 8s with periodic stop check
-                        for _ in range(16):
-                            if is_stop_requested():
-                                cancelled_by_user = True
-                                break
-                            time.sleep(0.5)
-
-                    if cancelled_by_user:
-                        break
-
-                    if not success_urls:
-                        raise TimeoutError("Render timeout (melebihi 5 menit).")
-
-                    # Download locally
-                    saved_files = []
-                    for u_idx, u in enumerate(success_urls):
-                        loc_p = download_remote_image(u, gen_id, u_idx)
-                        if loc_p:
-                            saved_files.append(loc_p)
-                            st.session_state["latest_images"].append(loc_p)
-
-                            # Upload to Google Drive if enabled
-                            if is_gdrive_sync_enabled():
-                                try:
-                                    append_log(f"[{i+1}/{total_items}] ☁️ Mengunggah ke Google Drive...", "active")
-                                    if upload_to_gdrive(loc_p, log_callback=append_log):
-                                        append_log(f"[{i+1}/{total_items}] ☁️ Berhasil tersimpan di Google Drive!", "success")
-                                except Exception as gd_err:
-                                    append_log(f"[{i+1}/{total_items}] ⚠️ Gagal simpan ke G-Drive: {gd_err}", "failed")
-
-                    update_generation_complete(
-                        generation_id=gen_id,
-                        status="success",
-                        remote_urls=success_urls,
-                        local_paths=saved_files
-                    )
-                    
-                    total_dur = int(time.time() - prompt_start_time)
-                    st.session_state["batch_stats"]["success"] += 1
-                    update_item_status(i, "SELESAI", "✅ SELESAI", time_str=f"{total_dur}s", file_p=saved_files[0] if saved_files else None)
-                    append_log(f"[{i+1}/{total_items}] Berhasil ({total_dur}s)! File tersimpan di outputs/", "success")
-
-                except InterruptedError:
-                    cancelled_by_user = True
-                    break
-                except Exception as ex:
-                    total_dur = int(time.time() - prompt_start_time)
-                    st.session_state["batch_stats"]["failed"] += 1
-                    update_item_status(i, "GAGAL", "❌ GAGAL", time_str=f"{total_dur}s", err=str(ex))
-                    append_log(f"[{i+1}/{total_items}] Gagal: {str(ex)}", "failed")
-
-            # Handle cancellation if requested
-            if cancelled_by_user:
-                remaining_count = 0
-                for rem_idx in range(len(st.session_state["prompt_tracker_items"])):
-                    item = st.session_state["prompt_tracker_items"][rem_idx]
-                    if item["status"] in ("MENUNGGU", "LIMIT_RPM", "SUBMIT"):
-                        item["status"] = "DIBATALKAN"
-                        item["badge"] = "🛑 DIBATALKAN"
-                        remaining_count += 1
-                st.session_state["batch_stats"]["cancelled"] += remaining_count
-                append_log(f"🛑 Batch dihentikan oleh pengguna. {remaining_count} prompt dibatalkan.", "failed")
-                render_monitor_prompt_status(st.session_state["prompt_tracker_items"], prompt_status_container)
-
-            if STOP_FLAG_FILE.exists():
-                STOP_FLAG_FILE.unlink()
-
-            st.session_state["batch_stats"]["active"] = 0
-            st.session_state["batch_stats"]["remaining"] = 0
-            append_log("Pemrosesan antrean Batch Generate selesai.", "active")
+        # Auto-refresh UI every 2 seconds while background worker is active
+        if batch_state["is_active"]:
+            time.sleep(2)
             st.rerun()
 
     # ---------------------------------------------------------
@@ -1671,9 +1515,33 @@ def main():
                     if test_file.exists():
                         test_file.unlink()
 
-        # 4. Storage and DB Status
+        # 4. Windows Startup Auto-Resume Setting
         st.markdown("---")
-        st.markdown('<div class="section-label"><span>4. STATUS PENYIMPANAN SISTEM & DATABASE</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label"><span>4. AUTO-RESUME SETELAH RESTART / SHUTDOWN KOMPUTER</span></div>', unsafe_allow_html=True)
+        st.caption("Jika komputer dimatikan atau restart saat batch sedang berjalan, fitur ini membuat proses otomatis melanjutkan tugas yang tertunda secara mandiri segera setelah komputer dinyalakan kembali.")
+        
+        st_enabled = is_startup_enabled()
+        sc1, sc2 = st.columns([2.5, 1.5])
+        with sc1:
+            st_text = "🟢 AKTIF (Otomatis Resume saat Windows Boot)" if st_enabled else "⚪ TIDAK AKTIF"
+            st.markdown(f"Status Startup Windows: **{st_text}**")
+        with sc2:
+            if not st_enabled:
+                if st.button("🚀 Aktifkan Auto-Resume di Startup", use_container_width=True):
+                    if enable_startup_autoresume():
+                        st.success("✅ Auto-Resume berhasil dipasang di Windows Startup!")
+                        st.rerun()
+                    else:
+                        st.error("Gagal memasang shortcut di Windows Startup.")
+            else:
+                if st.button("🗑️ Nonaktifkan Auto-Resume Startup", use_container_width=True):
+                    disable_startup_autoresume()
+                    st.info("Auto-Resume Windows Startup dinonaktifkan.")
+                    st.rerun()
+
+        # 5. Storage and DB Status
+        st.markdown("---")
+        st.markdown('<div class="section-label"><span>5. STATUS PENYIMPANAN SISTEM & DATABASE</span></div>', unsafe_allow_html=True)
         sc1, sc2, sc3 = st.columns(3)
         with sc1:
             tot_h = len(fetch_history(search_query="", model_filter="All"))
